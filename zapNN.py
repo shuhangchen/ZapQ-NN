@@ -5,6 +5,7 @@ import os
 import random
 import numpy as np
 import matplotlib
+# saving high quality figures
 matplotlib.use('agg')
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.pyplot as plt
@@ -16,7 +17,6 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 import time
-
 from config import GetParameters
 
 class NET(nn.Module):
@@ -39,15 +39,15 @@ class NET(nn.Module):
 
 class ZapNN():
 
-    eps = 1e-4    # used in computing matrix gain G_n
+    eps = 1e-4              # epsilon used in computing matrix gain G_n
     beta = 1
-    gamma = 0.85   # parameter for the second time scale (corresponds to \rho in the paper)
-    eps_greedy = 0.2   # parameter for the epsilon-greedy policy
+    gamma = 0.85            # parameter for the second time scale (corresponds to \rho in the paper)
+    eps_greedy = 0.2        # epsilon for the epsilon-greedy policy
     
     def __init__(self, env):
-        '''Initalize the setup for Zap Q-learning. '''
-        self.net = NET(5, [24, 16, 10]) # 
-        self.zeta = NET(5, [24, 16, 10]) # eligibility vector
+        '''Initalize Zap Q-learning agent.'''
+        self.net = NET(5, [24, 16, 10]) 
+        self.zeta = NET(5, [24, 16, 10])                            # delayed Q-function for computing the eligibility vector
         self.zeta.load_state_dict(self.net.state_dict())
         self.action_n = env.action_space.n
         self.size = sum(p.numel() for p in self.net.parameters())
@@ -55,11 +55,12 @@ class ZapNN():
         self.Ahat = torch.eye(self.size, requires_grad = False)
         self.A, self.barf = torch.zeros(self.size, self.size, requires_grad = False), torch.zeros(self.size, requires_grad = False)
         self.iter_nums = [0, 0]
-        self.ratio, self.lr = 100, 0.005   # constant step size
+        self.ratio, self.lr = 100, 0.005                             # constant step size
         self.block = 50
         return
 
     def sarsa(self, state, ptype = 'eps'):
+        '''Epsilon greedy policy.'''
         if ptype == 'eps':
             if np.random.rand() < self.eps_greedy:
                 return np.random.randint(2)
@@ -68,9 +69,7 @@ class ZapNN():
             raise NameError('Sarsa type not properly defied yet')
     
     def decide(self, state, strategy):
-        '''Use policy updated after last episode. Here just self.net since self.net is not update until the end of current episode.
-        We also use epsilon greedy.
-        '''
+        '''Behavior policy.'''
         if strategy == 'greedy':
             return self.greedy_act(state)
         elif strategy == 'sarsa':
@@ -79,7 +78,7 @@ class ZapNN():
             raise NameError('Running policy has not been defined yet.')
 
     def greedy_act(self, nstate):
-        '''select action based on the current value function. This is used for Q-learning update'''
+        '''select the greedy action based on the current value function. This is used for Q-learning update'''
         with torch.no_grad():
             qs = [self.net(nstate, naction) for naction in range(2)]
             return np.argmax(qs)
@@ -94,7 +93,7 @@ class ZapNN():
 
     def grad_td(self, state, action, state_next, greedy_act, reward, params, done):
         '''
-        Compute the gradient of temporal difference error.
+        Compute the gradient of temporal difference error d_{n+1}.
         '''
         self.net.zero_grad()
         output = reward +  (not done) * self.beta * self.net(state_next, greedy_act) - self.net(state, action)
@@ -105,7 +104,7 @@ class ZapNN():
         
     def zap_jacob(self, state, action, state_next, reward, done):
         '''
-        Compute the jacobian matrix with zeta being delayed.
+        Compute the jacobian matrix A_n(\theta_n) = f(\theta_n, \Phi_{n+1}) with zeta being delayed.
         '''
         greedy_act = self.greedy_act(state_next)
         params = list(self.net.parameters())
@@ -116,9 +115,8 @@ class ZapNN():
     
     def learn(self, state, action, reward, state_next, episode, done, ):
         ''' 
-        Accumulate the one-step update for the parameters of Zap net.
+        Accumulate the one-step SA update within a block.
         '''
-        ## the gradient of \barf at (X_n, U_n).
         A, sa_update= self.zap_jacob(state, action, state_next, reward, done)
         self.barf +=  1.0/((self.iter_nums[1] % self.block) + 1.0)*(sa_update - self.barf)
         self.A +=  1.0/((self.iter_nums[1] % self.block) + 1.0)*(A  - self.A)
@@ -130,8 +128,7 @@ class ZapNN():
 
     def update(self, block_n, episode, stepsize = 'ds', offset = 1.0):
         '''
-        Update the parameters of the network after one episode.
-        offset is n_0 in defining decreasing step-size in the paper.
+        Update the parameters of \haA_n, \theta_n by Zap SA algorithm using accumulated SA updates averages over the last block.
         '''
         if stepsize == 'ds':
             # decreasing step-size
@@ -146,7 +143,7 @@ class ZapNN():
         else:
             raise NameError('Step size for Zap not recognized.')
 
-        ## put flattened parameters back to the parameters of neural net
+        ## update the parameters of neural net
         self._add_grad(td.view(-1), self.net.parameters())
         
         ## clear the temporary gains and barfs accumulated
@@ -159,16 +156,12 @@ class ZapNN():
         return
 
     def _add_grad(self, td, params):
-        ''' 
-        Adding the update to the parameters of the network.
-        Note that we operate over .data, not the tensors themselves, to avoid tracking history.
-        '''
+        ''' Adding the update to the parameters of the network.'''
         offset = 0
         for p in params:
             numel = p.numel()
             # use p.data such that this operation won't be traced to compute gradients.
             p.data.add_(td[offset:offset + numel].view_as(p.data))
-            # p.data.clamp_(min= -1e4, max= 1e4)
             offset += numel
         assert offset == self.size, "dimension of gradient is different than dimension of parameters." 
         return
@@ -248,13 +241,10 @@ def OneRun(env, args, exp_indx, render):
             print('Start testing!... ' + str(perf_eval))
             policy_rewards.append(perf_eval)
     torch.save(policy_rewards, '{}policy_rewards_{}.pt'.format(args.result_dir, exp_indx))
-    
     return 
     
 
 if __name__ == '__main__':
-    ## the Net module for the off_policy_net
-    ## from Net import Net
     env = gym.make('CartPole-v0')
     render = False
     args = GetParameters()
@@ -267,7 +257,7 @@ if __name__ == '__main__':
     if not os.path.exists(args.result_dir):
         os.mkdir(args.result_dir)
 
-    for i in range(49,-1, -1):
+    for i in range(50):
         OneRun(env, args, i, render)
     env.close()
 
